@@ -1,15 +1,10 @@
-version: '3.9'
-
-# Production compose — EC2 instance runs backend + NATS only.
-# Postgres → AWS RDS  |  S3 → AWS S3  |  No MinIO.
-
 services:
 
   nats:
     image: nats:2.10-alpine
     restart: unless-stopped
     ports:
-      - "4222:4222"
+      - "127.0.0.1:4222:4222"   # bind to localhost only — not exposed externally
 
   backend:
     build: .
@@ -18,16 +13,5 @@ services:
       - "8080:8080"
     depends_on:
       - nats
-    environment:
-      PORT:                 "8080"
-      POSTGRES_DSN:         "${POSTGRES_DSN}"
-      NATS_URL:             "nats://nats:4222"
-      S3_BUCKET:            "${S3_BUCKET}"
-      AWS_REGION:           "${AWS_REGION}"
-      AWS_ACCESS_KEY_ID:    "${AWS_ACCESS_KEY_ID}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      # Leave S3_ENDPOINT empty — uses real AWS S3
-      S3_ENDPOINT:          ""
-      FRONTEND_URL:         "${FRONTEND_URL}"
     env_file:
       - .env.production
