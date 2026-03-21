@@ -1,0 +1,25 @@
+# Go
+backend/bin/
+backend/*.exe
+backend/tmp/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env*.local
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
