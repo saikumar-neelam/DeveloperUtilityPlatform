@@ -147,18 +147,21 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
 	r.Use(corsMiddleware(cfg.FrontendURL))
+	// Note: middleware.Timeout is NOT applied globally because SSE connections
+	// are long-lived. Regular API handlers are fast; no per-route timeout needed.
 
 	h.Routes(r)
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
 
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        fmt.Sprintf(":%s", cfg.Port),
+		Handler:     r,
+		ReadTimeout: 15 * time.Second,
+		// WriteTimeout must be 0 (unlimited) because SSE connections stream
+		// indefinitely. Individual handlers use context deadlines instead.
+		WriteTimeout: 0,
 		IdleTimeout:  120 * time.Second,
 	}
 
