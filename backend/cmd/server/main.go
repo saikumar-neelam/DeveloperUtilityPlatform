@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,6 +56,45 @@ func loadConfig() Config {
 	}
 }
 
+// ensureDatabase creates the target database if it does not already exist.
+// It connects to the "postgres" maintenance database on the same host, so the
+// target database doesn't need to exist yet.
+func ensureDatabase(ctx context.Context, dsn string) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("parse dsn: %w", err)
+	}
+
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if dbName == "" {
+		return fmt.Errorf("no database name in DSN")
+	}
+
+	// Connect to the maintenance database instead.
+	u.Path = "/postgres"
+	conn, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		return fmt.Errorf("connect maintenance db: %w", err)
+	}
+	defer conn.Close()
+
+	var exists bool
+	err = conn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbName,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("check database existence: %w", err)
+	}
+
+	if !exists {
+		// Database name comes from our own DSN — safe to interpolate.
+		if _, err := conn.Exec(ctx, "CREATE DATABASE "+dbName); err != nil {
+			return fmt.Errorf("create database %q: %w", dbName, err)
+		}
+	}
+	return nil
+}
+
 func main() {
 	// Load .env if present (no-op in production where env vars are set externally).
 	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
@@ -72,6 +113,11 @@ func main() {
 	// ── Dependencies ──────────────────────────────────────────────────────────
 
 	// Postgres
+	if err := ensureDatabase(ctx, cfg.PostgresDSN); err != nil {
+		log.Error("ensure database", "error", err)
+		os.Exit(1)
+	}
+
 	dbpool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Error("connect postgres", "error", err)
