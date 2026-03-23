@@ -7,9 +7,13 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/devutility/webhookplatform/internal/domain"
+	"github.com/devutility/webhookplatform/internal/mailer"
+	"github.com/devutility/webhookplatform/internal/ratelimit"
 	"github.com/google/uuid"
 )
 
@@ -51,9 +55,15 @@ func generateEndpointName() string {
 }
 
 const (
-	maxBodyBytes    = 10 << 20      // 10 MB
-	endpointLifetime = 24 * time.Hour // free-tier endpoint TTL
+	maxBodyBytes     = 10 << 20          // 10 MB per request
+	endpointLifetime = 24 * time.Hour    // default endpoint TTL
+	maxStoredReqs    = 500               // max requests kept per endpoint (rolling)
+	rlRate           = 5.0               // sustained req/s per endpoint
+	rlBurst          = 20               // burst capacity per endpoint
 )
+
+// ErrRateLimited is returned when an endpoint exceeds its ingestion rate.
+var ErrRateLimited = fmt.Errorf("rate limit exceeded")
 
 // Broadcaster pushes new webhook requests to connected SSE clients.
 type Broadcaster interface {
@@ -69,6 +79,8 @@ type WebhookService struct {
 	publisher    domain.EventPublisher
 	replayer     domain.Replayer
 	broadcaster  Broadcaster
+	mailer       *mailer.Mailer
+	limiter      ratelimit.RateLimiter
 	log          *slog.Logger
 }
 
@@ -79,6 +91,8 @@ func New(
 	publisher domain.EventPublisher,
 	replayer domain.Replayer,
 	broadcaster Broadcaster,
+	m *mailer.Mailer,
+	rl ratelimit.RateLimiter,
 	log *slog.Logger,
 ) *WebhookService {
 	return &WebhookService{
@@ -88,34 +102,89 @@ func New(
 		publisher:    publisher,
 		broadcaster:  broadcaster,
 		replayer:     replayer,
+		mailer:       m,
+		limiter:      rl,
 		log:          log,
 	}
 }
 
+// bodyPreview returns up to 500 runes of body as a UTF-8 string for search.
+func bodyPreview(b []byte) string {
+	s := string(b)
+	if utf8.RuneCountInString(s) <= 500 {
+		return s
+	}
+	i := 0
+	for n := 0; n < 500; n++ {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+	}
+	return s[:i]
+}
+
 // ── Endpoint management ───────────────────────────────────────────────────────
 
-func (s *WebhookService) ListEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
-	endpoints, err := s.endpointRepo.ListEndpoints(ctx)
+func (s *WebhookService) ListEndpoints(ctx context.Context, userID string) ([]*domain.Endpoint, error) {
+	endpoints, err := s.endpointRepo.ListEndpoints(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("service: list endpoints: %w", err)
 	}
 	return endpoints, nil
 }
 
-func (s *WebhookService) CreateEndpoint(ctx context.Context, targetURL string) (*domain.Endpoint, error) {
+// ttlDuration maps a TTL key to a duration. Zero means no expiry.
+func ttlDuration(ttl string) time.Duration {
+	switch ttl {
+	case "7d":
+		return 7 * 24 * time.Hour
+	case "30d":
+		return 30 * 24 * time.Hour
+	case "never":
+		return 0
+	default: // "24h" or empty
+		return endpointLifetime
+	}
+}
+
+func (s *WebhookService) CreateEndpoint(ctx context.Context, targetURL, userID, ttl string) (*domain.Endpoint, error) {
 	now := time.Now().UTC()
+	dur := ttlDuration(ttl)
+	var expiresAt time.Time
+	if dur == 0 {
+		expiresAt = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC) // effectively never
+	} else {
+		expiresAt = now.Add(dur)
+	}
 	e := &domain.Endpoint{
-		ID:        uuid.NewString(),
-		Name:      generateEndpointName(),
-		TargetURL: targetURL,
-		CreatedAt: now,
-		ExpiresAt: now.Add(endpointLifetime),
+		ID:                  uuid.NewString(),
+		Name:                generateEndpointName(),
+		TargetURL:           targetURL,
+		UserID:              userID,
+		CreatedAt:           now,
+		ExpiresAt:           expiresAt,
+		ResponseStatus:      200,
+		ResponseContentType: "application/json",
+		ResponseHeaders:     map[string]string{},
+		ResponseBody:        "",
 	}
 	if err := s.endpointRepo.CreateEndpoint(ctx, e); err != nil {
 		return nil, fmt.Errorf("service: create endpoint: %w", err)
 	}
-	s.log.Info("endpoint created", "id", e.ID, "name", e.Name)
+	s.log.Info("endpoint created", "id", e.ID, "name", e.Name, "ttl", ttl)
 	return e, nil
+}
+
+// DeleteAllRequests removes all requests captured by an endpoint.
+func (s *WebhookService) DeleteAllRequests(ctx context.Context, endpointID string) error {
+	// Also purge S3 objects for this endpoint.
+	if err := s.storage.DeleteByPrefix(ctx, endpointID+"/"); err != nil {
+		s.log.Error("delete all requests: purge s3", "endpoint_id", endpointID, "error", err)
+	}
+	if err := s.requestRepo.DeleteAllRequests(ctx, endpointID); err != nil {
+		return fmt.Errorf("service: delete all requests: %w", err)
+	}
+	s.log.Info("all requests deleted", "endpoint_id", endpointID)
+	return nil
 }
 
 func (s *WebhookService) DeleteEndpoint(ctx context.Context, id string) error {
@@ -139,20 +208,64 @@ func (s *WebhookService) GetEndpoint(ctx context.Context, id string) (*domain.En
 	return e, nil
 }
 
+// RenameEndpoint updates the display name of an endpoint.
+func (s *WebhookService) RenameEndpoint(ctx context.Context, id, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("service: name cannot be empty")
+	}
+	if err := s.endpointRepo.UpdateEndpointName(ctx, id, name); err != nil {
+		return fmt.Errorf("service: rename endpoint: %w", err)
+	}
+	return nil
+}
+
+// UpdateEndpointNotify sets the notification email for an endpoint.
+func (s *WebhookService) UpdateEndpointNotify(ctx context.Context, id, email string) error {
+	if err := s.endpointRepo.UpdateEndpointNotify(ctx, id, email); err != nil {
+		return fmt.Errorf("service: update endpoint notify: %w", err)
+	}
+	return nil
+}
+
+// UpdateEndpointResponse saves custom response config for an endpoint.
+func (s *WebhookService) UpdateEndpointResponse(ctx context.Context, id string, status int, contentType string, headers map[string]string, body string) error {
+	if err := s.endpointRepo.UpdateEndpointResponse(ctx, id, status, contentType, headers, body); err != nil {
+		return fmt.Errorf("service: update endpoint response: %w", err)
+	}
+	s.log.Info("endpoint response updated", "id", id, "status", status)
+	return nil
+}
+
+// GetLatestReplayResult returns the most recent replay result for a request.
+func (s *WebhookService) GetLatestReplayResult(ctx context.Context, requestID string) (*domain.ReplayResult, error) {
+	result, err := s.requestRepo.GetLatestReplayResult(ctx, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("service: get replay result: %w", err)
+	}
+	return result, nil
+}
+
 // ── Webhook ingestion ─────────────────────────────────────────────────────────
 
 // IngestWebhook captures a raw HTTP request and persists it.
-// It stores metadata in Postgres, the body in S3, and publishes an event to NATS.
-func (s *WebhookService) IngestWebhook(ctx context.Context, endpointID string, r *http.Request) (*domain.WebhookRequest, error) {
+// Returns the saved request and the endpoint (for custom response).
+func (s *WebhookService) IngestWebhook(ctx context.Context, endpointID string, r *http.Request) (*domain.WebhookRequest, *domain.Endpoint, error) {
 	// Validate the endpoint exists before doing any expensive work.
-	if _, err := s.endpointRepo.GetEndpointByID(ctx, endpointID); err != nil {
-		return nil, fmt.Errorf("service: ingest: %w", err)
+	ep, err := s.endpointRepo.GetEndpointByID(ctx, endpointID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("service: ingest: %w", err)
+	}
+
+	// Rate limit: 5 req/s sustained, burst of 20, per endpoint.
+	if !s.limiter.Allow(endpointID) {
+		return nil, nil, ErrRateLimited
 	}
 
 	// Read body with a hard size cap.
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("service: read body: %w", err)
+		return nil, nil, fmt.Errorf("service: read body: %w", err)
 	}
 
 	id := uuid.NewString()
@@ -161,7 +274,7 @@ func (s *WebhookService) IngestWebhook(ctx context.Context, endpointID string, r
 
 	// Upload body to S3.
 	if err := s.storage.Upload(ctx, s3Key, body, contentType); err != nil {
-		return nil, fmt.Errorf("service: upload payload: %w", err)
+		return nil, nil, fmt.Errorf("service: upload payload: %w", err)
 	}
 
 	req := &domain.WebhookRequest{
@@ -172,13 +285,36 @@ func (s *WebhookService) IngestWebhook(ctx context.Context, endpointID string, r
 		QueryParams: r.URL.Query(),
 		ContentType: contentType,
 		BodySize:    int64(len(body)),
+		BodyPreview: bodyPreview(body),
 		S3Key:       s3Key,
 		CreatedAt:   time.Now().UTC(),
 	}
 
 	// Persist metadata to Postgres.
 	if err := s.requestRepo.SaveRequest(ctx, req); err != nil {
-		return nil, fmt.Errorf("service: save request metadata: %w", err)
+		return nil, nil, fmt.Errorf("service: save request metadata: %w", err)
+	}
+
+	// Rolling cap: keep at most maxStoredReqs per endpoint; evict oldest.
+	go func() {
+		count, err := s.requestRepo.CountRequests(context.Background(), endpointID)
+		if err == nil && count > maxStoredReqs {
+			_ = s.requestRepo.DeleteOldestRequests(context.Background(), endpointID, count-maxStoredReqs)
+		}
+	}()
+
+	// Send notification email asynchronously (non-blocking).
+	if ep.NotifyEmail != "" {
+		go func() {
+			subject := fmt.Sprintf("[WebhookDB] New %s request on %s", r.Method, ep.Name)
+			msgBody := fmt.Sprintf(
+				"Endpoint: %s\nMethod: %s\nContent-Type: %s\nBody size: %d bytes\n\nPreview:\n%s",
+				ep.Name, r.Method, contentType, len(body), bodyPreview(body),
+			)
+			if err := s.mailer.Send(ep.NotifyEmail, subject, msgBody); err != nil {
+				s.log.Error("send notification email", "error", err, "to", ep.NotifyEmail)
+			}
+		}()
 	}
 
 	// Publish event to NATS (non-blocking: log error, don't fail the request).
@@ -190,7 +326,7 @@ func (s *WebhookService) IngestWebhook(ctx context.Context, endpointID string, r
 	s.broadcaster.Broadcast(req)
 
 	s.log.Info("webhook ingested", "id", id, "endpoint_id", endpointID, "method", r.Method, "bytes", req.BodySize)
-	return req, nil
+	return req, ep, nil
 }
 
 // ── Request listing ───────────────────────────────────────────────────────────

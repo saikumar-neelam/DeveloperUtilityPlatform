@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,17 +17,21 @@ import (
 )
 
 // WebhookService is the interface the handler depends on.
-// Defined here (at the consumer) following Go's interface convention.
 type WebhookService interface {
 	GetEndpoint(ctx context.Context, id string) (*domain.Endpoint, error)
-	ListEndpoints(ctx context.Context) ([]*domain.Endpoint, error)
-	CreateEndpoint(ctx context.Context, targetURL string) (*domain.Endpoint, error)
+	ListEndpoints(ctx context.Context, userID string) ([]*domain.Endpoint, error)
+	CreateEndpoint(ctx context.Context, targetURL, userID, ttl string) (*domain.Endpoint, error)
 	DeleteEndpoint(ctx context.Context, id string) error
-	IngestWebhook(ctx context.Context, endpointID string, r *http.Request) (*domain.WebhookRequest, error)
+	UpdateEndpointResponse(ctx context.Context, id string, status int, contentType string, headers map[string]string, body string) error
+	RenameEndpoint(ctx context.Context, id, name string) error
+	DeleteAllRequests(ctx context.Context, endpointID string) error
+	UpdateEndpointNotify(ctx context.Context, id, email string) error
+	IngestWebhook(ctx context.Context, endpointID string, r *http.Request) (*domain.WebhookRequest, *domain.Endpoint, error)
 	ListRequests(ctx context.Context, endpointID string, limit, offset int) ([]*domain.WebhookRequest, error)
 	GetRequest(ctx context.Context, requestID string) (*domain.WebhookRequest, error)
 	GetRequestBody(ctx context.Context, requestID string) ([]byte, string, error)
 	EnqueueReplay(ctx context.Context, requestID, targetURLOverride string) error
+	GetLatestReplayResult(ctx context.Context, requestID string) (*domain.ReplayResult, error)
 }
 
 // Handler holds the HTTP handlers for the webhook platform.
@@ -42,48 +47,66 @@ func New(svc *service.WebhookService, h *hub.SSEHub, log *slog.Logger) *Handler 
 
 // Routes registers all routes on the given chi router.
 func (h *Handler) Routes(r chi.Router) {
-	// Webhook ingestion — accept ALL HTTP methods so senders can use any verb
-	// and users can open the URL in a browser (GET) to test it.
 	r.HandleFunc("/hook/{id}", h.IngestWebhook)
 
-	// Management API.
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/endpoints", h.ListEndpoints)
 		r.Post("/endpoints", h.CreateEndpoint)
 		r.Get("/endpoints/{id}", h.GetEndpoint)
 		r.Delete("/endpoints/{id}", h.DeleteEndpoint)
+		r.Patch("/endpoints/{id}/response", h.UpdateEndpointResponse)
+		r.Patch("/endpoints/{id}/name", h.RenameEndpoint)
+		r.Patch("/endpoints/{id}/notify", h.UpdateEndpointNotify)
 		r.Get("/endpoints/{id}/requests", h.ListRequests)
-		r.Get("/endpoints/{id}/stream", h.StreamRequests) // SSE live feed
+		r.Delete("/endpoints/{id}/requests", h.DeleteAllRequests)
+		r.Get("/endpoints/{id}/stream", h.StreamRequests)
 		r.Get("/requests/{id}", h.GetRequest)
 		r.Get("/requests/{id}/body", h.GetRequestBody)
 		r.Post("/requests/{id}/replay", h.ReplayRequest)
+		r.Get("/requests/{id}/replay/result", h.GetReplayResult)
 	})
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-// IngestWebhook handles POST /hook/{id}.
-// It is the critical ingestion path — responds as fast as possible.
+// IngestWebhook handles /hook/{id} for all HTTP methods.
+// Responds with the endpoint's custom response configuration.
 func (h *Handler) IngestWebhook(w http.ResponseWriter, r *http.Request) {
 	endpointID := chi.URLParam(r, "id")
 
-	req, err := h.svc.IngestWebhook(r.Context(), endpointID, r)
+	_, ep, err := h.svc.IngestWebhook(r.Context(), endpointID, r)
 	if err != nil {
+		if errors.Is(err, service.ErrRateLimited) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded — max 5 req/s per endpoint")
+			return
+		}
 		h.log.Error("ingest webhook", "endpoint_id", endpointID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"request_id":  req.ID,         // use this for /api/requests/{request_id}/replay
-		"endpoint_id": req.EndpointID, // use this for /api/endpoints/{endpoint_id}/requests
-		"status":      "received",
-	})
+	// Write custom response headers.
+	for k, v := range ep.ResponseHeaders {
+		w.Header().Set(k, v)
+	}
+
+	// Default to JSON if body is empty and no content-type override.
+	ct := ep.ResponseContentType
+	if ct == "" {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(ep.ResponseStatus)
+
+	if ep.ResponseBody != "" {
+		_, _ = w.Write([]byte(ep.ResponseBody))
+	}
 }
 
 // ListEndpoints handles GET /api/endpoints.
 func (h *Handler) ListEndpoints(w http.ResponseWriter, r *http.Request) {
-	endpoints, err := h.svc.ListEndpoints(r.Context())
+	endpoints, err := h.svc.ListEndpoints(r.Context(), "")
 	if err != nil {
 		h.log.Error("list endpoints", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to list endpoints")
@@ -96,22 +119,48 @@ func (h *Handler) ListEndpoints(w http.ResponseWriter, r *http.Request) {
 }
 
 // CreateEndpoint handles POST /api/endpoints.
-// Name is auto-generated; only target_url is accepted (optional).
 func (h *Handler) CreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TargetURL string `json:"target_url"`
+		TTL       string `json:"ttl"` // "24h" | "7d" | "30d" | "never"
 	}
-	// Body is optional — ignore decode errors.
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
-	endpoint, err := h.svc.CreateEndpoint(r.Context(), body.TargetURL)
+	endpoint, err := h.svc.CreateEndpoint(r.Context(), body.TargetURL, "", body.TTL)
 	if err != nil {
 		h.log.Error("create endpoint", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to create endpoint")
 		return
 	}
-
 	writeJSON(w, http.StatusCreated, endpoint)
+}
+
+// UpdateEndpointNotify handles PATCH /api/endpoints/{id}/notify.
+func (h *Handler) UpdateEndpointNotify(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if err := h.svc.UpdateEndpointNotify(r.Context(), id, body.Email); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update notify email")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// DeleteAllRequests handles DELETE /api/endpoints/{id}/requests.
+func (h *Handler) DeleteAllRequests(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if err := h.svc.DeleteAllRequests(r.Context(), id); err != nil {
+		h.log.Error("delete all requests", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to delete requests")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
 }
 
 // DeleteEndpoint handles DELETE /api/endpoints/{id}.
@@ -137,10 +186,56 @@ func (h *Handler) GetEndpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, endpoint)
 }
 
+// RenameEndpoint handles PATCH /api/endpoints/{id}/name.
+func (h *Handler) RenameEndpoint(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if err := h.svc.RenameEndpoint(r.Context(), id, body.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "renamed"})
+}
+
+// UpdateEndpointResponse handles PATCH /api/endpoints/{id}/response.
+func (h *Handler) UpdateEndpointResponse(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var body struct {
+		Status      int               `json:"status"`
+		ContentType string            `json:"content_type"`
+		Headers     map[string]string `json:"headers"`
+		Body        string            `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.Status < 100 || body.Status > 599 {
+		writeError(w, http.StatusBadRequest, "status must be 100–599")
+		return
+	}
+	if body.Headers == nil {
+		body.Headers = map[string]string{}
+	}
+
+	if err := h.svc.UpdateEndpointResponse(r.Context(), id, body.Status, body.ContentType, body.Headers, body.Body); err != nil {
+		h.log.Error("update endpoint response", "id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
 // ListRequests handles GET /api/endpoints/{id}/requests.
 func (h *Handler) ListRequests(w http.ResponseWriter, r *http.Request) {
 	endpointID := chi.URLParam(r, "id")
-
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
@@ -150,15 +245,13 @@ func (h *Handler) ListRequests(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list requests")
 		return
 	}
-
 	if reqs == nil {
-		reqs = []*domain.WebhookRequest{} // return [] not null
+		reqs = []*domain.WebhookRequest{}
 	}
 	writeJSON(w, http.StatusOK, reqs)
 }
 
 // GetRequest handles GET /api/requests/{id}.
-// Returns full request metadata including headers and query params.
 func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "id")
 	req, err := h.svc.GetRequest(r.Context(), requestID)
@@ -171,7 +264,6 @@ func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetRequestBody handles GET /api/requests/{id}/body.
-// Downloads the raw body from S3/MinIO and streams it back with the original content-type.
 func (h *Handler) GetRequestBody(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "id")
 
@@ -181,7 +273,6 @@ func (h *Handler) GetRequestBody(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
@@ -195,9 +286,8 @@ func (h *Handler) ReplayRequest(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "id")
 
 	var body struct {
-		TargetURL string `json:"target_url"` // optional override
+		TargetURL string `json:"target_url"`
 	}
-	// Ignore decode errors — body is optional.
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	if err := h.svc.EnqueueReplay(r.Context(), requestID, body.TargetURL); err != nil {
@@ -205,23 +295,31 @@ func (h *Handler) ReplayRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"status":     "queued",
 		"request_id": requestID,
 	})
 }
 
-// StreamRequests handles GET /api/endpoints/{id}/stream.
-// It opens an SSE connection and pushes new webhook requests to the browser in real time.
+// GetReplayResult handles GET /api/requests/{id}/replay/result.
+func (h *Handler) GetReplayResult(w http.ResponseWriter, r *http.Request) {
+	requestID := chi.URLParam(r, "id")
+	result, err := h.svc.GetLatestReplayResult(r.Context(), requestID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// StreamRequests handles GET /api/endpoints/{id}/stream (SSE).
 func (h *Handler) StreamRequests(w http.ResponseWriter, r *http.Request) {
 	endpointID := chi.URLParam(r, "id")
 
-	// SSE headers.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering if present
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -232,7 +330,6 @@ func (h *Handler) StreamRequests(w http.ResponseWriter, r *http.Request) {
 	ch := h.hub.Subscribe(endpointID)
 	defer h.hub.Unsubscribe(endpointID, ch)
 
-	// Send a heartbeat every 30 s to keep the connection alive through proxies.
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 

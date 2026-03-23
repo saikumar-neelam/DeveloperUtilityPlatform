@@ -1,17 +1,39 @@
 services:
 
+  # ── NATS ─────────────────────────────────────────────────────────────────────
   nats:
     image: nats:2.10-alpine
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:4222:4222"   # bind to localhost only — not exposed externally
 
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no  # memory-only, no persistence needed
+
+  # ── Go backend ───────────────────────────────────────────────────────────────
   backend:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     depends_on:
       - nats
+      - redis
     env_file:
       - .env.production
+
+  # ── Next.js frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      args:
+        BACKEND_URL: http://backend:8080
+        NEXT_PUBLIC_BACKEND_URL: https://api.debugflow.dev
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      BACKEND_URL: http://backend:8080
+    depends_on:
+      - backend

@@ -11,8 +11,18 @@ type Endpoint struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	TargetURL string    `json:"target_url"`
+	UserID    string    `json:"user_id,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+
+	// Custom response — what the endpoint returns to the webhook sender.
+	ResponseStatus      int               `json:"response_status"`
+	ResponseContentType string            `json:"response_content_type"`
+	ResponseHeaders     map[string]string `json:"response_headers"`
+	ResponseBody        string            `json:"response_body"`
+
+	// Notification email — send an email when a request is received.
+	NotifyEmail string `json:"notify_email"`
 }
 
 type WebhookRequest struct {
@@ -23,6 +33,7 @@ type WebhookRequest struct {
 	QueryParams map[string][]string `json:"query_params"`
 	ContentType string              `json:"content_type"`
 	BodySize    int64               `json:"body_size"`
+	BodyPreview string              `json:"body_preview"`
 	S3Key       string              `json:"s3_key"`
 	CreatedAt   time.Time           `json:"created_at"`
 }
@@ -50,11 +61,18 @@ type ReplayJob struct {
 type EndpointRepo interface {
 	CreateEndpoint(ctx context.Context, e *Endpoint) error
 	GetEndpointByID(ctx context.Context, id string) (*Endpoint, error)
-	ListEndpoints(ctx context.Context) ([]*Endpoint, error)
+	// ListEndpoints returns all endpoints owned by the given user.
+	ListEndpoints(ctx context.Context, userID string) ([]*Endpoint, error)
 	// ListExpiredEndpoints returns all endpoints whose expires_at is in the past.
 	ListExpiredEndpoints(ctx context.Context) ([]*Endpoint, error)
 	// DeleteEndpoint removes an endpoint and its associated requests (cascade).
 	DeleteEndpoint(ctx context.Context, id string) error
+	// UpdateEndpointResponse persists the custom response configuration.
+	UpdateEndpointResponse(ctx context.Context, id string, status int, contentType string, headers map[string]string, body string) error
+	// UpdateEndpointName renames an endpoint.
+	UpdateEndpointName(ctx context.Context, id, name string) error
+	// UpdateEndpointNotify sets the notification email for an endpoint.
+	UpdateEndpointNotify(ctx context.Context, id, email string) error
 }
 
 // RequestRepo persists and retrieves captured webhook requests and replay results.
@@ -63,6 +81,14 @@ type RequestRepo interface {
 	GetRequestByID(ctx context.Context, id string) (*WebhookRequest, error)
 	ListRequestsByEndpoint(ctx context.Context, endpointID string, limit, offset int) ([]*WebhookRequest, error)
 	SaveReplayResult(ctx context.Context, result *ReplayResult) error
+	// GetLatestReplayResult returns the most recent replay result for a request.
+	GetLatestReplayResult(ctx context.Context, requestID string) (*ReplayResult, error)
+	// DeleteAllRequests removes every request captured by an endpoint.
+	DeleteAllRequests(ctx context.Context, endpointID string) error
+	// CountRequests returns the number of requests for an endpoint.
+	CountRequests(ctx context.Context, endpointID string) (int, error)
+	// DeleteOldestRequests removes the oldest n requests for an endpoint.
+	DeleteOldestRequests(ctx context.Context, endpointID string, n int) error
 }
 
 // ── Storage interface ─────────────────────────────────────────────────────────

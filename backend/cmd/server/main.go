@@ -15,7 +15,9 @@ import (
 
 	"github.com/devutility/webhookplatform/internal/handler"
 	"github.com/devutility/webhookplatform/internal/hub"
+	"github.com/devutility/webhookplatform/internal/mailer"
 	"github.com/devutility/webhookplatform/internal/migration"
+	"github.com/devutility/webhookplatform/internal/ratelimit"
 	natspub "github.com/devutility/webhookplatform/internal/publisher/nats"
 	"github.com/devutility/webhookplatform/internal/repository/postgres"
 	s3store "github.com/devutility/webhookplatform/internal/storage/s3"
@@ -40,6 +42,15 @@ type Config struct {
 	S3SecretKey string
 	// FrontendURL is used for CORS; defaults to localhost:3000 for development.
 	FrontendURL string
+	// JWTSecret signs and verifies auth tokens. Must be set in production.
+	JWTSecret string
+	// SMTP config for email notifications (all optional — disabled if SMTPHost is empty).
+	SMTPHost string
+	SMTPPort string
+	SMTPUser string
+	SMTPPass string
+	SMTPFrom string
+	RedisURL string
 }
 
 func loadConfig() Config {
@@ -53,6 +64,13 @@ func loadConfig() Config {
 		S3AccessKey: env("AWS_ACCESS_KEY_ID", ""),
 		S3SecretKey: env("AWS_SECRET_ACCESS_KEY", ""),
 		FrontendURL: env("FRONTEND_URL", "http://localhost:3000"),
+		JWTSecret:   env("JWT_SECRET", "change-me-in-production"),
+		SMTPHost:    env("SMTP_HOST", ""),
+		SMTPPort:    env("SMTP_PORT", "587"),
+		SMTPUser:    env("SMTP_USER", ""),
+		SMTPPass:    env("SMTP_PASS", ""),
+		SMTPFrom:    env("SMTP_FROM", "notifications@debugflow.dev"),
+		RedisURL:    env("REDIS_URL", "redis://redis:6379"),
 	}
 }
 
@@ -175,13 +193,40 @@ func main() {
 	// SSE hub
 	sseHub := hub.New(log)
 
+	// Mailer (nil if SMTP_HOST not set)
+	ml := mailer.New(mailer.Config{
+		Host: cfg.SMTPHost,
+		Port: cfg.SMTPPort,
+		User: cfg.SMTPUser,
+		Pass: cfg.SMTPPass,
+		From: cfg.SMTPFrom,
+	})
+
+	// Rate limiter — Redis sliding window (5 req/s per endpoint, 1-second window)
+	rl, err := ratelimit.NewRedis(cfg.RedisURL, time.Second, 5)
+	if err != nil {
+		log.Warn("redis rate limiter unavailable, falling back to in-memory", "error", err)
+	}
+	var limiter ratelimit.RateLimiter
+	if rl != nil {
+		limiter = rl
+		log.Info("rate limiter ready", "backend", "redis")
+	} else {
+		limiter = ratelimit.New(5, 20)
+		log.Info("rate limiter ready", "backend", "in-memory")
+	}
+
 	// Service
-	svc := service.New(repo, repo, store, pub, replayWorker, sseHub, log)
+	svc := service.New(repo, repo, store, pub, replayWorker, sseHub, ml, limiter, log)
 
 	// Cleanup worker — deletes expired endpoints and their S3 objects every 5 min
 	cleanupWorker := worker.NewCleanupWorker(repo, store, log)
 	cleanupWorker.Start(ctx)
 	log.Info("cleanup worker started")
+
+	// Auth
+	authSvc := service.NewAuth(repo, cfg.JWTSecret, log)
+	authHandler := handler.NewAuth(authSvc)
 
 	// Handler
 	h := handler.New(svc, sseHub, log)
@@ -196,6 +241,11 @@ func main() {
 	r.Use(corsMiddleware(cfg.FrontendURL))
 	// Note: middleware.Timeout is NOT applied globally because SSE connections
 	// are long-lived. Regular API handlers are fast; no per-route timeout needed.
+
+	// Auth routes (optional — accounts exist but are not enforced)
+	r.Post("/auth/register", authHandler.Register)
+	r.Post("/auth/login", authHandler.Login)
+	r.Get("/auth/me", authHandler.Me)
 
 	h.Routes(r)
 
@@ -249,8 +299,8 @@ func corsMiddleware(allowedOrigin string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return

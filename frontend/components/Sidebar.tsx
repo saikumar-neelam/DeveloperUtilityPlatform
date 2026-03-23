@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
 import type { Endpoint } from '@/lib/types';
 
 const STORAGE_KEY = 'webhookdb_recent';
@@ -22,27 +23,44 @@ function saveRecent(ep: Endpoint) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, 8)));
 }
 
-export function Sidebar() {
+interface Props {
+  open: boolean;
+  onClose: () => void;
+}
+
+export function Sidebar({ open, onClose }: Props) {
   const router   = useRouter();
   const pathname = usePathname();
+  const { user, logout } = useAuth();
   const [recent, setRecent]     = useState<Endpoint[]>([]);
   const [creating, setCreating] = useState(false);
 
+  function handleLogout() {
+    logout();
+    router.push('/auth/signin');
+  }
+
   useEffect(() => {
     const now = Date.now();
-    setRecent(loadRecent().filter(e => new Date(e.expires_at).getTime() > now));
-  }, [pathname]); // refresh list on navigation
+    setRecent(loadRecent().filter(e => new Date(e.expires_at).getFullYear() >= 9999 || new Date(e.expires_at).getTime() > now));
+  }, [pathname]);
 
   async function handleNew() {
     setCreating(true);
     try {
       const ep = await api.endpoints.create();
       saveRecent(ep);
-      setRecent(loadRecent().filter(e => new Date(e.expires_at).getTime() > Date.now()));
+      setRecent(loadRecent().filter(e => new Date(e.expires_at).getFullYear() >= 9999 || new Date(e.expires_at).getTime() > Date.now()));
       router.push(`/endpoints/${ep.id}`);
+      onClose();
     } finally {
       setCreating(false);
     }
+  }
+
+  function navigate(path: string) {
+    router.push(path);
+    onClose();
   }
 
   const activeId = pathname.startsWith('/endpoints/')
@@ -50,12 +68,16 @@ export function Sidebar() {
     : null;
 
   return (
-    <aside className="fixed left-0 top-0 h-full w-[240px] bg-white border-r border-slate-200 flex flex-col z-20">
-
-      {/* Logo — links back to landing */}
+    <aside className={cn(
+      'fixed left-0 top-0 h-full w-[240px] bg-white border-r border-slate-200 flex flex-col z-30',
+      'transition-transform duration-200',
+      'md:translate-x-0',
+      open ? 'translate-x-0' : '-translate-x-full',
+    )}>
+      {/* Logo */}
       <div
         className="h-14 flex items-center gap-2.5 px-5 border-b border-slate-200 shrink-0 cursor-pointer"
-        onClick={() => router.push('/')}
+        onClick={() => navigate('/')}
       >
         <span className="text-violet-600"><WebhookIcon /></span>
         <span className="text-sm font-semibold text-slate-900 tracking-tight">WebhookDB</span>
@@ -75,34 +97,30 @@ export function Sidebar() {
 
       {/* Recent endpoints */}
       <div className="flex-1 overflow-y-auto px-3 py-2">
-        {recent.length > 0 && (
+        {recent.length > 0 ? (
           <>
-            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider px-2 mb-1.5">
-              Recent
-            </p>
+            <p className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider px-2 mb-1.5">Recent</p>
             <nav className="space-y-0.5">
               {recent.map(ep => {
                 const isActive = ep.id === activeId;
                 const expiresAt = new Date(ep.expires_at);
+                const never = expiresAt.getFullYear() >= 9999;
                 const hoursLeft = Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 3_600_000));
-                const expiry    = hoursLeft > 0 ? `${hoursLeft}h left` : '< 1h left';
+                const expiry = never ? 'Never expires' : hoursLeft > 0 ? `${hoursLeft}h left` : '< 1h left';
 
                 return (
                   <button
                     key={ep.id}
-                    onClick={() => router.push(`/endpoints/${ep.id}`)}
+                    onClick={() => navigate(`/endpoints/${ep.id}`)}
                     className={cn(
                       'w-full flex flex-col items-start px-3 py-2 rounded-md text-left transition-colors',
-                      isActive
-                        ? 'bg-violet-50 text-violet-700'
-                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900',
+                      isActive ? 'bg-violet-50 text-violet-700' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900',
                     )}
                   >
                     <span className="text-xs font-medium truncate w-full">{ep.name}</span>
                     <span className={cn(
                       'text-[10px] mt-0.5',
-                      isActive ? 'text-violet-400' : 'text-slate-400',
-                      hoursLeft < 2 ? 'text-amber-500' : '',
+                      isActive ? 'text-violet-400' : never ? 'text-emerald-500' : hoursLeft < 2 ? 'text-amber-500' : 'text-slate-400',
                     )}>
                       {expiry}
                     </span>
@@ -111,21 +129,32 @@ export function Sidebar() {
               })}
             </nav>
           </>
-        )}
-
-        {recent.length === 0 && (
-          <p className="text-xs text-slate-400 px-2 py-2">
-            No recent endpoints.
-          </p>
+        ) : (
+          <p className="text-xs text-slate-400 px-2 py-2">No recent endpoints.</p>
         )}
       </div>
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-slate-200 shrink-0">
-        <div className="flex items-center gap-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          <span className="text-xs text-slate-500">All systems operational</span>
-        </div>
+        {user ? (
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-full bg-violet-100 flex items-center justify-center shrink-0">
+              <span className="text-[10px] font-bold text-violet-700 uppercase">{user.name[0]}</span>
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-slate-700 truncate">{user.name}</p>
+              <p className="text-[10px] text-slate-400 truncate">{user.email}</p>
+            </div>
+            <button onClick={handleLogout} title="Sign out" className="text-slate-300 hover:text-red-500 transition-colors">
+              <LogoutIcon />
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span className="text-xs text-slate-500">All systems operational</span>
+          </div>
+        )}
       </div>
     </aside>
   );
@@ -151,6 +180,15 @@ function SpinnerIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="animate-spin">
       <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+    </svg>
+  );
+}
+function LogoutIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" />
+      <line x1="21" y1="12" x2="9" y2="12" />
     </svg>
   );
 }

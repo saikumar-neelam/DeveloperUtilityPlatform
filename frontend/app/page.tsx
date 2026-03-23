@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
 import { timeAgo } from '@/lib/utils';
 import type { Endpoint } from '@/lib/types';
 
@@ -25,7 +26,9 @@ function saveRecent(ep: Endpoint) {
 
 export default function LandingPage() {
   const router = useRouter();
+  const { user } = useAuth();
   const [targetUrl, setTargetUrl] = useState('');
+  const [ttl, setTtl]             = useState('24h');
   const [creating, setCreating]   = useState(false);
   const [error, setError]         = useState('');
   const [recent, setRecent]       = useState<Endpoint[]>([]);
@@ -39,7 +42,7 @@ export default function LandingPage() {
     setCreating(true);
     setError('');
     try {
-      const ep = await api.endpoints.create(targetUrl.trim() || undefined);
+      const ep = await api.endpoints.create(targetUrl.trim() || undefined, ttl);
       saveRecent(ep);
       router.push(`/endpoints/${ep.id}`);
     } catch {
@@ -67,16 +70,22 @@ export default function LandingPage() {
           <span className="text-violet-600"><WebhookIcon /></span>
           <span className="text-sm font-semibold text-slate-900 tracking-tight">WebhookDB</span>
         </div>
-        <a
-          href="https://github.com"
-          className="text-xs text-slate-400 hover:text-slate-700 transition-colors"
-        >
-          GitHub
-        </a>
+        <div className="flex items-center gap-3">
+          {user ? (
+            <a href="/dashboard" className="text-xs font-medium text-violet-600 hover:text-violet-700 transition-colors">
+              Dashboard →
+            </a>
+          ) : (
+            <>
+              <a href="/auth/signin" className="text-xs text-slate-500 hover:text-slate-700 transition-colors">Sign in</a>
+              <a href="/auth/signup" className="text-xs font-medium bg-violet-600 hover:bg-violet-700 text-white px-3 py-1.5 rounded-lg transition-colors">Get started</a>
+            </>
+          )}
+        </div>
       </header>
 
       {/* Hero */}
-      <main className="flex-1 flex flex-col items-center justify-center px-6 py-20">
+      <main className="flex-1 flex flex-col items-center justify-center px-4 sm:px-6 py-10 sm:py-20">
         <div className="w-full max-w-xl text-center">
 
           {/* Badge */}
@@ -85,7 +94,7 @@ export default function LandingPage() {
             No signup required · Free for 24 hours
           </div>
 
-          <h1 className="text-4xl font-bold text-slate-900 leading-tight tracking-tight mb-4">
+          <h1 className="text-3xl sm:text-4xl font-bold text-slate-900 leading-tight tracking-tight mb-4">
             Inspect webhooks<br />instantly.
           </h1>
           <p className="text-slate-500 text-lg mb-10">
@@ -93,11 +102,11 @@ export default function LandingPage() {
           </p>
 
           {/* Input + CTA */}
-          <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-4 text-left">
-            <label className="block text-xs font-medium text-slate-500 mb-1.5">
-              Forward to (optional)
-            </label>
-            <div className="flex gap-2">
+          <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-4 text-left space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                Forward to (optional)
+              </label>
               <input
                 ref={inputRef}
                 type="url"
@@ -105,13 +114,40 @@ export default function LandingPage() {
                 onChange={e => setTargetUrl(e.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder="https://your-api.com/webhooks"
-                className="flex-1 text-sm bg-white border border-slate-200 rounded-lg px-3 py-2.5 outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent placeholder:text-slate-400 transition"
+                className="w-full text-sm bg-white border border-slate-200 rounded-lg px-3 py-2.5 outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent placeholder:text-slate-400 transition"
                 disabled={creating}
               />
+              <p className="text-xs text-slate-400 mt-1.5">
+                Leave blank to capture only. Add a URL to also forward received webhooks.
+              </p>
             </div>
-            <p className="text-xs text-slate-400 mt-2">
-              Leave blank to capture only. Add a URL to forward received webhooks there.
-            </p>
+            <div>
+              <label className="block text-xs font-medium text-slate-500 mb-1.5">
+                Endpoint lifetime
+              </label>
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { value: '24h',   label: '24 hours' },
+                  { value: '7d',    label: '7 days' },
+                  { value: '30d',   label: '30 days' },
+                  { value: 'never', label: 'Never' },
+                ].map(opt => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setTtl(opt.value)}
+                    disabled={creating}
+                    className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${
+                      ttl === opt.value
+                        ? 'bg-violet-600 border-violet-600 text-white'
+                        : 'bg-white border-slate-200 text-slate-600 hover:border-violet-400'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
           <button
@@ -138,7 +174,7 @@ export default function LandingPage() {
         </div>
 
         {/* How it works */}
-        <div className="w-full max-w-xl mt-16 grid grid-cols-3 gap-6">
+        <div className="w-full max-w-xl mt-16 grid grid-cols-1 sm:grid-cols-3 gap-6">
           {[
             { step: '1', title: 'Generate URL',    desc: 'Click the button to get your unique webhook URL instantly.' },
             { step: '2', title: 'Send webhooks',   desc: 'Point any webhook provider at your URL and trigger events.' },
@@ -163,9 +199,10 @@ export default function LandingPage() {
             <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
               {active.map((ep, i) => {
                 const expiresAt = new Date(ep.expires_at);
+                const isNever = expiresAt.getFullYear() >= 9999;
                 const hoursLeft = Math.max(0, Math.floor((expiresAt.getTime() - now) / 3_600_000));
                 const minsLeft  = Math.max(0, Math.floor(((expiresAt.getTime() - now) % 3_600_000) / 60_000));
-                const expiry    = hoursLeft > 0 ? `${hoursLeft}h ${minsLeft}m left` : `${minsLeft}m left`;
+                const expiry    = isNever ? 'Never expires' : hoursLeft > 0 ? `${hoursLeft}h ${minsLeft}m left` : `${minsLeft}m left`;
 
                 return (
                   <div
@@ -196,7 +233,7 @@ export default function LandingPage() {
       {/* Footer */}
       <footer className="border-t border-slate-100 px-6 py-4 text-center">
         <p className="text-xs text-slate-400">
-          Endpoints auto-delete after 24 hours · All data is ephemeral
+          Choose your endpoint lifetime · All data is ephemeral
         </p>
       </footer>
     </div>

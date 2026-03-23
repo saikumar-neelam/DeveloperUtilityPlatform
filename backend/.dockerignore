@@ -1,0 +1,9 @@
+.git
+.env*
+*.md
+tmp/
+bin/
+Makefile
+nginx.conf
+setup-ec2.sh
+docker-compose*.yml

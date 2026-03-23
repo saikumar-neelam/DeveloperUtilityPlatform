@@ -1,0 +1,7 @@
+api.debugflow.dev {
+    reverse_proxy backend:8080
+}
+
+wh.debugflow.dev {
+    reverse_proxy frontend:3000
+}

@@ -23,10 +23,18 @@ func New(db *pgxpool.Pool) *Repository {
 // ── EndpointRepo ──────────────────────────────────────────────────────────────
 
 func (r *Repository) CreateEndpoint(ctx context.Context, e *domain.Endpoint) error {
+	headers, _ := json.Marshal(e.ResponseHeaders)
+	var userID *string
+	if e.UserID != "" {
+		userID = &e.UserID
+	}
 	_, err := r.db.Exec(ctx,
-		`INSERT INTO endpoints (id, name, target_url, created_at, expires_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		e.ID, e.Name, e.TargetURL, e.CreatedAt, e.ExpiresAt,
+		`INSERT INTO endpoints
+		 (id, name, target_url, user_id, created_at, expires_at,
+		  response_status, response_content_type, response_headers, response_body, notify_email)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		e.ID, e.Name, e.TargetURL, userID, e.CreatedAt, e.ExpiresAt,
+		e.ResponseStatus, e.ResponseContentType, headers, e.ResponseBody, e.NotifyEmail,
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: create endpoint: %w", err)
@@ -34,10 +42,22 @@ func (r *Repository) CreateEndpoint(ctx context.Context, e *domain.Endpoint) err
 	return nil
 }
 
-func (r *Repository) ListEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
-	rows, err := r.db.Query(ctx,
-		`SELECT id, name, target_url, created_at, expires_at FROM endpoints ORDER BY created_at DESC`,
-	)
+func (r *Repository) ListEndpoints(ctx context.Context, userID string) ([]*domain.Endpoint, error) {
+	var rows pgx.Rows
+	var err error
+	if userID == "" {
+		rows, err = r.db.Query(ctx,
+			`SELECT id, name, target_url, user_id, created_at, expires_at,
+			        response_status, response_content_type, response_headers, response_body, notify_email
+			 FROM endpoints ORDER BY created_at DESC`,
+		)
+	} else {
+		rows, err = r.db.Query(ctx,
+			`SELECT id, name, target_url, user_id, created_at, expires_at,
+			        response_status, response_content_type, response_headers, response_body, notify_email
+			 FROM endpoints WHERE user_id = $1 ORDER BY created_at DESC`, userID,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list endpoints: %w", err)
 	}
@@ -45,32 +65,35 @@ func (r *Repository) ListEndpoints(ctx context.Context) ([]*domain.Endpoint, err
 
 	var endpoints []*domain.Endpoint
 	for rows.Next() {
-		var e domain.Endpoint
-		if err := rows.Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt, &e.ExpiresAt); err != nil {
+		e, err := scanEndpoint(rows.Scan)
+		if err != nil {
 			return nil, fmt.Errorf("postgres: scan endpoint: %w", err)
 		}
-		endpoints = append(endpoints, &e)
+		endpoints = append(endpoints, e)
 	}
 	return endpoints, rows.Err()
 }
 
 func (r *Repository) GetEndpointByID(ctx context.Context, id string) (*domain.Endpoint, error) {
-	var e domain.Endpoint
-	err := r.db.QueryRow(ctx,
-		`SELECT id, name, target_url, created_at, expires_at FROM endpoints WHERE id = $1`, id,
-	).Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt, &e.ExpiresAt)
+	row := r.db.QueryRow(ctx,
+		`SELECT id, name, target_url, user_id, created_at, expires_at,
+		        response_status, response_content_type, response_headers, response_body, notify_email
+		 FROM endpoints WHERE id = $1`, id,
+	)
+	e, err := scanEndpoint(row.Scan)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("endpoint %q not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres: get endpoint: %w", err)
 	}
-	return &e, nil
+	return e, nil
 }
 
 func (r *Repository) ListExpiredEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
 	rows, err := r.db.Query(ctx,
-		`SELECT id, name, target_url, created_at, expires_at
+		`SELECT id, name, target_url, user_id, created_at, expires_at,
+		        response_status, response_content_type, response_headers, response_body, notify_email
 		 FROM endpoints WHERE expires_at <= NOW() ORDER BY expires_at`,
 	)
 	if err != nil {
@@ -80,22 +103,105 @@ func (r *Repository) ListExpiredEndpoints(ctx context.Context) ([]*domain.Endpoi
 
 	var endpoints []*domain.Endpoint
 	for rows.Next() {
-		var e domain.Endpoint
-		if err := rows.Scan(&e.ID, &e.Name, &e.TargetURL, &e.CreatedAt, &e.ExpiresAt); err != nil {
+		e, err := scanEndpoint(rows.Scan)
+		if err != nil {
 			return nil, fmt.Errorf("postgres: scan expired endpoint: %w", err)
 		}
-		endpoints = append(endpoints, &e)
+		endpoints = append(endpoints, e)
 	}
 	return endpoints, rows.Err()
 }
 
 func (r *Repository) DeleteEndpoint(ctx context.Context, id string) error {
-	// webhook_requests and replay_results are deleted via ON DELETE CASCADE on the FK.
 	_, err := r.db.Exec(ctx, `DELETE FROM endpoints WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete endpoint: %w", err)
 	}
 	return nil
+}
+
+func (r *Repository) UpdateEndpointName(ctx context.Context, id, name string) error {
+	_, err := r.db.Exec(ctx, `UPDATE endpoints SET name = $2 WHERE id = $1`, id, name)
+	if err != nil {
+		return fmt.Errorf("postgres: update endpoint name: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) UpdateEndpointNotify(ctx context.Context, id, email string) error {
+	_, err := r.db.Exec(ctx, `UPDATE endpoints SET notify_email = $2 WHERE id = $1`, id, email)
+	if err != nil {
+		return fmt.Errorf("postgres: update endpoint notify: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) UpdateEndpointResponse(ctx context.Context, id string, status int, contentType string, headers map[string]string, body string) error {
+	headersJSON, _ := json.Marshal(headers)
+	_, err := r.db.Exec(ctx,
+		`UPDATE endpoints
+		 SET response_status = $2, response_content_type = $3,
+		     response_headers = $4, response_body = $5
+		 WHERE id = $1`,
+		id, status, contentType, headersJSON, body,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update endpoint response: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) DeleteAllRequests(ctx context.Context, endpointID string) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM webhook_requests WHERE endpoint_id = $1`, endpointID)
+	if err != nil {
+		return fmt.Errorf("postgres: delete all requests: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) CountRequests(ctx context.Context, endpointID string) (int, error) {
+	var n int
+	err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM webhook_requests WHERE endpoint_id = $1`, endpointID,
+	).Scan(&n)
+	return n, err
+}
+
+func (r *Repository) DeleteOldestRequests(ctx context.Context, endpointID string, n int) error {
+	_, err := r.db.Exec(ctx, `
+		DELETE FROM webhook_requests
+		WHERE id IN (
+			SELECT id FROM webhook_requests
+			WHERE endpoint_id = $1
+			ORDER BY created_at ASC
+			LIMIT $2
+		)`, endpointID, n,
+	)
+	return err
+}
+
+// scanEndpoint scans a row into an Endpoint using the provided scan function.
+func scanEndpoint(scan func(...any) error) (*domain.Endpoint, error) {
+	var e domain.Endpoint
+	var headersRaw []byte
+	var userID *string
+	err := scan(
+		&e.ID, &e.Name, &e.TargetURL, &userID, &e.CreatedAt, &e.ExpiresAt,
+		&e.ResponseStatus, &e.ResponseContentType, &headersRaw, &e.ResponseBody, &e.NotifyEmail,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if userID != nil {
+		e.UserID = *userID
+	}
+	if len(headersRaw) > 0 {
+		_ = json.Unmarshal(headersRaw, &e.ResponseHeaders)
+	}
+	if e.ResponseHeaders == nil {
+		e.ResponseHeaders = map[string]string{}
+	}
+	return &e, nil
 }
 
 // ── RequestRepo ───────────────────────────────────────────────────────────────
@@ -112,11 +218,11 @@ func (r *Repository) SaveRequest(ctx context.Context, req *domain.WebhookRequest
 
 	_, err = r.db.Exec(ctx,
 		`INSERT INTO webhook_requests
-		 (id, endpoint_id, method, headers, query_params, content_type, body_size, s3_key, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		 (id, endpoint_id, method, headers, query_params, content_type, body_size, body_preview, s3_key, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		req.ID, req.EndpointID, req.Method,
 		headers, queryParams,
-		req.ContentType, req.BodySize, req.S3Key, req.CreatedAt,
+		req.ContentType, req.BodySize, req.BodyPreview, req.S3Key, req.CreatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: save request: %w", err)
@@ -129,12 +235,12 @@ func (r *Repository) GetRequestByID(ctx context.Context, id string) (*domain.Web
 	var headersRaw, queryRaw []byte
 
 	err := r.db.QueryRow(ctx,
-		`SELECT id, endpoint_id, method, headers, query_params, content_type, body_size, s3_key, created_at
+		`SELECT id, endpoint_id, method, headers, query_params, content_type, body_size, body_preview, s3_key, created_at
 		 FROM webhook_requests WHERE id = $1`, id,
 	).Scan(
 		&req.ID, &req.EndpointID, &req.Method,
 		&headersRaw, &queryRaw,
-		&req.ContentType, &req.BodySize, &req.S3Key, &req.CreatedAt,
+		&req.ContentType, &req.BodySize, &req.BodyPreview, &req.S3Key, &req.CreatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("request %q not found", id)
@@ -149,10 +255,8 @@ func (r *Repository) GetRequestByID(ctx context.Context, id string) (*domain.Web
 }
 
 func (r *Repository) ListRequestsByEndpoint(ctx context.Context, endpointID string, limit, offset int) ([]*domain.WebhookRequest, error) {
-	// List query fetches only the columns needed for the table view.
-	// Heavy fields (headers, query_params) are loaded on-demand via GetRequestByID.
 	rows, err := r.db.Query(ctx,
-		`SELECT id, endpoint_id, method, content_type, body_size, s3_key, created_at
+		`SELECT id, endpoint_id, method, content_type, body_size, body_preview, s3_key, created_at
 		 FROM webhook_requests
 		 WHERE endpoint_id = $1
 		 ORDER BY created_at DESC
@@ -169,7 +273,7 @@ func (r *Repository) ListRequestsByEndpoint(ctx context.Context, endpointID stri
 		var req domain.WebhookRequest
 		if err := rows.Scan(
 			&req.ID, &req.EndpointID, &req.Method,
-			&req.ContentType, &req.BodySize, &req.S3Key, &req.CreatedAt,
+			&req.ContentType, &req.BodySize, &req.BodyPreview, &req.S3Key, &req.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan request row: %w", err)
 		}
@@ -190,6 +294,24 @@ func (r *Repository) SaveReplayResult(ctx context.Context, result *domain.Replay
 		return fmt.Errorf("postgres: save replay result: %w", err)
 	}
 	return nil
+}
+
+func (r *Repository) GetLatestReplayResult(ctx context.Context, requestID string) (*domain.ReplayResult, error) {
+	var res domain.ReplayResult
+	err := r.db.QueryRow(ctx,
+		`SELECT id, request_id, status_code, response_body, duration_ms, error, created_at
+		 FROM replay_results
+		 WHERE request_id = $1
+		 ORDER BY created_at DESC
+		 LIMIT 1`, requestID,
+	).Scan(&res.ID, &res.RequestID, &res.StatusCode, &res.ResponseBody, &res.DurationMs, &res.Error, &res.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("no replay result for request %q", requestID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get replay result: %w", err)
+	}
+	return &res, nil
 }
 
 // Compile-time interface checks.
